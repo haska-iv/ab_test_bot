@@ -1,0 +1,2 @@
+slack-bolt>=1.18
+google-cloud-bigquery>=3.11
