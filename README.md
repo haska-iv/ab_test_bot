@@ -1,78 +1,79 @@
 # A/B Test Design Bot
 
-Slack bot for experiment design automation. Built at GoMining to standardise A/B test setup across CRM, product, and marketing teams.
+Slack bot that designs A/B experiments through a conversational interface powered by Claude.
+Built at GoMining to standardise experiment setup across CRM and product teams.
 
 ## Problem
 
-Before this tool, experiment parameters were calculated ad-hoc — sample sizes guessed, MDE not defined upfront, no check for audience overlap between concurrent tests. This led to underpowered tests and conflicting experiments running on the same segment simultaneously.
+Analysts were calculating sample sizes ad-hoc, defining MDE after seeing results, and running experiments on the same audience simultaneously. This produced unreliable results and wasted traffic.
 
 ## What it does
 
-**`/abtest design`** — opens a modal where you fill in:
-- Primary metric + baseline value
-- MDE (minimum lift you care about, in %)
-- Daily eligible users and max duration
+Mention the bot in any Slack channel or thread. It asks for your experiment parameters, fetches real baseline data from the database, runs power analysis, and registers the design.
 
-The bot returns:
-- Required sample size per variant
-- Full MDE table (how many days needed for each MDE threshold)
-- Overlap check against active experiments in the same segment
-- Registers the experiment in BigQuery with a unique ID
+```
+@ab-bot  I want to test a new onboarding email on users inactive for 15–30 days
 
-**`/abtest status`** — lists all currently running and planned experiments with owner and date range.
-
-**`/abtest check`** — standalone overlap check: pick a segment and date range, returns any conflicting experiments.
+→ ⏳ Иду в базу, считаю...
+→ Segment: 4 200 users  |  Baseline purchase_rate: 4.3%
+→ MDE table:
+     uplift  | n/variant | weeks feasible
+     0.5x (+0.2pp) |  18 400  |  18    ✗
+     1.0x (+0.4pp) |   4 700  |   5    ✓
+     1.5x (+0.6pp) |   2 100  |   3    ✓
+→ Verdict: feasible at 1x uplift (5 weeks).  Save to registry? [yes / adjust]
+```
 
 ## Architecture
 
 ```
 Slack (Socket Mode)
-      │
+      │  app_mention / thread message
       ▼
-  bot.py  (slack-bolt)
-  ├── sample_size.py          ← power analysis, MDE table
-  └── experiment_registry.py  ← BigQuery-backed registry
-                                  analytics.ab_experiments.registry
+  bot.py
+      │  one ABTestAgent per thread
+      ▼
+  agent.py  — Claude tool-use loop (up to 8 iterations)
+  ├── db.py          ← PostgreSQL: metrics catalog, segment queries, registry
+  └── sample_size.py ← power analysis (pure Python, no scipy)
 ```
 
-`sample_size.py` has no external dependencies — uses a normal approximation (Abramowitz & Stegun) instead of scipy so it can run in lightweight Lambda / Cloud Function environments.
+## Agent tools
 
-## Sample size logic
+| Tool | What it does |
+|---|---|
+| `get_metrics_catalog` | Lists valid metrics, types, and typical baselines |
+| `query_segment` | Counts users matching a SQL WHERE clause |
+| `get_segment_baseline` | Fetches actual baseline from DB (falls back to catalog midpoint) |
+| `run_power_analysis` | Returns MDE table + verdict (feasible / borderline / underpowered) |
+| `save_experiment` | Writes the completed design to the registry |
 
-For proportion metrics (conversion rate):
-- Cohen's h effect size between baseline and baseline × (1 + MDE)
-- Two-sided z-test at α = 0.05, power = 0.80 by default
-- Returns n per variant; multiply by variant count for total
-
-## MDE table example
-
-```
-  MDE |  n/variant |   Days |  Weeks
-------+------------+--------+-------
-  3%  |     22 101 |     45 |    6.4
-  5%  |      8 012 |     17 |    2.4
-  7%  |      4 120 |      9 |    1.3
- 10%  |      2 038 |      5 |    0.7
- 15%  |        916 |      2 |    0.3
-```
-
-## Overlap detection
-
-Experiments are stored in BigQuery with `segment`, `start_date`, `end_date`, `status`. Before registering a new experiment the bot queries for any active experiment with the same segment that overlaps the proposed time window.
-
-This prevents the most common source of SRM and inflated effects: two tests running on the same audience simultaneously.
+The agent never uses a user-supplied baseline — it always fetches real data.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
 
+# Init local DB
+psql -c "CREATE DATABASE ab_tests"
+psql ab_tests < schema.sql
+
+export DATABASE_URL=postgresql://localhost/ab_tests
+export ANTHROPIC_API_KEY=sk-ant-...
 export SLACK_BOT_TOKEN=xoxb-...
 export SLACK_APP_TOKEN=xapp-...
-export GCP_PROJECT=your-project-id
+export SLACK_SIGNING_SECRET=...
 
 python bot.py
 ```
 
-Slack app requires scopes: `commands`, `chat:write`, `chat:write.public`.
-BigQuery table schema: `experiment_id`, `name`, `owner`, `metric_primary`, `segment`, `variant_count`, `split`, `start_date`, `end_date`, `mde_relative`, `baseline`, `daily_users`, `status`, `metrics_guardrail`, `notes`, `created_at`.
+Slack app requires OAuth scopes: `app_mentions:read`, `chat:write`, `channels:history`, `groups:history`.
+
+## Key design choices
+
+**No hardcoded forms.** A Slack modal forces analysts to know the right parameters upfront. The conversational agent asks clarifying questions and can handle ambiguous descriptions ("inactive users" → SQL WHERE clause).
+
+**No scipy.** Power analysis uses a normal approximation (Abramowitz & Stegun) so the bot runs in minimal environments without a full scientific Python stack.
+
+**Thread isolation.** Each Slack thread gets its own agent instance with independent history. Parallel conversations don't interfere.
